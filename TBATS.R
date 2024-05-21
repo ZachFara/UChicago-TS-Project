@@ -1,3 +1,6 @@
+### ADSP 31006 IP02 Time Series Analysis and Forecasting Final Project ###
+### Daichi Ishikawa ###
+
 # Install library
 library(ggplot2)
 library(readxl)
