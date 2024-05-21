@@ -1,4 +1,4 @@
-# Install package
+# Install library
 library(ggplot2)
 library(readxl)
 library(lubridate)
@@ -11,13 +11,15 @@ library(stats)
 library(tseries)
 library(Metrics)
 library(forecast)
+library(xts)
+library(TSA)
 
 #######################
 #### Preprocessing ####
 #######################
 
 # Load data
-data <- read_excel("/Users/daichiishikawa/Desktop/UChicago Class/Spring_2024/Time Series/Final_Project/air+quality/AirQualityUCI.xlsx")
+data <- read_excel("data/AirQualityUCI.xlsx")
 data <- data[, c("Date", "Time", "CO(GT)", "T", "RH", "AH")]
 
 # Date time Format Change
@@ -158,6 +160,25 @@ head(test_data)
 ## Model and Eveluate ##
 ########################
 
+## Periodogram
+co_ts <- ts(train_data$`CO(GT)`, frequency = 24)
+# Calculate the periodogram
+p <- periodogram(co_ts)
+# Display the periodogram result
+print(p)
+
+# Number of top peaks to consider
+top_n <- 10
+# Find the frequencies with the highest spectral densities
+top_freq_indices <- order(p$spec, decreasing = TRUE)[1:top_n]
+top_freqs <- p$freq[top_freq_indices]
+# Calculate the corresponding seasonal periods
+seasonality_periods <- 1 / top_freqs
+# Print the detected seasonal periods
+print("Detected seasonality periods:")
+print(seasonality_periods)
+
+
 ## TBATS
 
 # Creating MSTS objects
@@ -168,7 +189,7 @@ tbats_model <- tbats(train_msts)
 # Plot the model
 plot(tbats_model)
 # Displaying model summary
-print(summary(tbats_model))
+print(as.character(tbats_model))
 
 # fit train
 train_fitted <- fitted(tbats_model)
