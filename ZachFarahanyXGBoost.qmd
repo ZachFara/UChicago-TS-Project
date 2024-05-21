@@ -1,0 +1,317 @@
+---
+title: "TSProject"
+format: html
+editor: visual
+---
+
+```{r}
+
+library(readxl)
+library(lubridate)
+library(imputeTS)
+library(zoo)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(imputeTS)
+library(ggplot2)
+library(forecast)
+
+df <- read_excel("./air+quality/AirQualityUCI.xlsx")
+
+df$DateTime <- ymd(df$Date) + hms(format(df$Time, "%H:%M:%S"))
+
+# Now let's fill all -200s with NA
+df[df == -200] <- NA
+
+# Fill NA
+df$filled_CO <- na.approx(df$`CO(GT)`)
+df$filled_T <- na.approx(df$`T`)
+df$filled_RH <- na.approx(df$`RH`)
+df$filled_AH <- na.approx(df$`AH`)
+
+# Make graphs of the NA interpolation that happened to verify that it looks nice
+graph.interpolation <- function(ts,var1, var2, name){
+  ggplot_na_imputations(ts[[var1]], ts[[var2]], size_points = .4, size_imputations = .4) + 
+    labs(title= name,
+         x = "Year-Month",
+         y = "Price",
+         color = "Data Type")
+}
+
+graph.interpolation(df, "CO(GT)", "filled_CO", "Carbon Monoxide (BEFORE CLEANING)")
+graph.interpolation(df, "T", "filled_T", "Temperature")
+graph.interpolation(df, "RH", "filled_RH", "Relative Humidity")
+graph.interpolation(df, "AH", "filled_AH", "Absolute Humidity")
+
+# REmove negatives
+df$filled_CO <- pmax(df$filled_CO)
+
+# Let's do some TS outlier detection
+df$filled_CO <- tsclean(df$filled_CO)
+
+graph.interpolation(df, "CO(GT)", "filled_CO", "Carbon Monoxide (AFTER CLEANING)")
+
+# Drop other columns
+df <- df %>%
+  select(filled_CO, filled_T, filled_RH, filled_AH, DateTime)
+```
+
+```{r}
+library(corrplot)
+# Now find correlations
+
+# Calculate correlation matrix
+df_subset <- df[, !colnames(df) %in% "DateTime"]
+correlation_matrix <- cor(df_subset, use = "complete.obs")
+corrplot(correlation_matrix, method = "color", type = "upper", order = "hclust", tl.col = "black", tl.srt = 45, addCoef.col = "black")
+
+# Relevant ACF plots
+acf(df$filled_CO, lag.max = 200)
+acf(df$filled_CO ^ 2, lag.max = 200)
+pacf(df$filled_CO, lag.max = 50)
+
+ggplot(df, aes(x = DateTime, y = filled_CO)) +
+  geom_line(group = 1, colour = "black", size = .2) +  # Line plot
+  labs(title = "Time Series Plot", x = "Date", y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Train test split
+cutoff_date <- max(df$DateTime) %m-% months(1)
+
+# Split the data into training and testing sets
+training_set <- df %>% filter(DateTime <= cutoff_date)
+testing_set <- df %>% filter(DateTime > cutoff_date)
+```
+
+# Initial modeling: Let's test our ARFIMA
+
+```{r}
+# I decided to keep this arfima modeling just since it demonstrates another tried model
+library(Metrics)
+library(xts)
+library(fGarch)
+model.arfima <- forecast::arfima(training_set$filled_CO)
+summary(model.arfima)
+```
+
+```{r}
+n_forecast_points <- nrow(testing_set)
+
+# Generate forecasts
+arfima.forecast <- forecast(model.arfima, h = n_forecast_points)
+```
+
+```{r}
+# Periodogram stuff to assist Daichi with his TBATS analysis:
+# This stuff will be mentioned in the appendix
+
+spectral.values <- spectrum(training_set$filled_CO)
+spec_values <- spectral.values$spec
+frequencies <- spectral.values$freq
+top_four_indices <- order(spec_values, decreasing = TRUE)[1:10]
+top_four_spec_values <- spec_values[top_four_indices]
+top_four_frequencies <- frequencies[top_four_indices]
+inverse_frequencies <- 1 / top_four_frequencies
+print(top_four_spec_values)
+print(top_four_frequencies)
+print(inverse_frequencies)
+```
+
+## XGB Model
+
+```{r}
+# Convert Date to a time series object
+# This code is basically just the same as the stuff that we did in class except with RF
+ts_xts <- xts(df$filled_CO, order.by = df$DateTime)
+lags <- 1:168 # Number of lags to consider
+lagged_data <- lapply(lags, function(l) lag(ts_xts, l))
+lagged_df <- data.frame(lagged_data)
+colnames(lagged_df) <- paste0("lag_", lags) # Rename columns with lag prefixes
+lagged_xts <- xts(lagged_df, order.by = index(ts_xts))
+lagged_xts <- na.omit(lagged_xts)
+final_data <- cbind(ts_xts, lagged_xts)
+final_data <- na.omit(final_data)
+start_index_for_test <- nrow(final_data) - nrow(testing_set) + 1
+train_data <- final_data[1:(start_index_for_test - 1), ]
+test_data <- final_data[start_index_for_test:nrow(final_data), ]
+```
+
+Let's train the XGBoost model now
+
+```{r}
+# Convert to XGB data objects
+library(xgboost)
+train_y <- train_data[, 1]
+test_y <- test_data[, 1]
+train_x <- train_data[, -1]
+test_x <- test_data[, -1]
+dtrain <- xgb.DMatrix(data = as.matrix(train_x), label = train_y)
+dtest <- xgb.DMatrix(data = as.matrix(test_x), label = test_y)
+```
+
+```{r}
+# Try a random XGB config to see if it might be good
+params <- list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.5,
+  colsample_bytree = 0.5
+)
+
+# Train the model
+num_rounds <- 1000
+model <- xgb.train(params, dtrain, num_rounds, watchlist = list(eval = dtest), early_stopping_rounds = 20)
+```
+
+Hyperparameter tuning
+
+```{r}
+library(xgboost)
+library(dplyr)
+
+# Set up the parameter grid
+param_grid <- expand.grid(
+  eta = seq(0.01, 0.3, by = 0.01),
+  max_depth = seq(3, 12, by = 1),
+  subsample = seq(0.3, 1.0, by = 0.05),
+  colsample_bytree = seq(0.3, 1.0, by = 0.05),
+  min_child_weight = seq(1, 10, by = 1),
+  lambda = seq(1, 50, by = 1),
+  stringsAsFactors = FALSE
+)
+
+set.seed(123)
+n_samples <- 100
+sampled_params <- param_grid %>% sample_n(n_samples)
+
+results <- data.frame()
+
+val_size <- 30 * 24 # Get a month of hourly data
+val_indices <- seq(nrow(dtrain) - val_size + 1, nrow(dtrain))
+subset_indices <- seq(1, nrow(dtrain) - val_size)
+dval <- slice(dtrain, val_indices)
+dtrain_subset <- slice(dtrain, subset_indices)
+
+for(i in 1:nrow(sampled_params)) {
+  print(paste("Progress:", i / nrow(sampled_params) * 100, "%"))
+  params <- list(
+    booster = "gbtree",
+    objective = "reg:squarederror",
+    eta = sampled_params$eta[i],
+    max_depth = sampled_params$max_depth[i],
+    subsample = sampled_params$subsample[i],
+    colsample_bytree = sampled_params$colsample_bytree[i],
+    min_child_weight = sampled_params$min_child_weight[i],
+    lambda = sampled_params$lambda[i]
+  )
+  
+  # Number of boosting rounds
+  num_rounds <- 500
+  
+  # Train the model using the subset of training data
+  xgb_model <- xgb.train(
+    params = params,
+    data = dtrain_subset,
+    nrounds = num_rounds,
+    watchlist = list(val = dval),
+    print_every_n = 100,
+    early_stopping_rounds = 10,
+    maximize = FALSE
+  )
+  
+  # Evaluate the model on the validation set
+  val_preds <- predict(xgb_model, dval)
+  val_rmse <- sqrt(mean((getinfo(dval, "label") - val_preds)^2))
+  
+  # Store the results
+  results <- rbind(results, c(sampled_params[i, ], RMSE = val_rmse))
+  print(paste("Validation RMSE for iteration", i, ":", val_rmse))
+}
+
+# Review the results to find the best parameters
+best_params <- results[which.min(results$RMSE), ]
+print("Best parameters found:")
+print(best_params)
+```
+
+```{r}
+# Load necessary libraries
+library(xgboost)
+library(dplyr)
+
+set.seed(123)
+
+# Re-train the model with the best parameters found
+best_params <- results[which.min(results$RMSE), ]
+
+final_params <- list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = best_params$eta,
+  max_depth = best_params$max_depth,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  min_child_weight = best_params$min_child_weight,
+  lambda = best_params$lambda
+)
+
+final_params <- list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = .04,
+  max_depth = 6,
+  subsample = .8,
+  colsample_bytree = 1,
+  min_child_weight = 6,
+  lambda = 15
+)
+
+num_rounds <- 500
+
+# Train the final model
+final_model <- xgb.train(
+params = final_params,
+data = dtrain,
+nrounds = num_rounds,
+watchlist = list(eval = dtest),
+early_stopping_rounds = 50,
+verbose = 1  
+)
+final_preds <- predict(final_model, dtest)
+train_preds <- predict(final_model, dtrain)
+final_rmse <- sqrt(mean((final_preds - test_y)^2))
+
+final_preds <- predict(final_model, dtest)
+
+final_rmse <- sqrt(mean((final_preds - test_y)^2))
+final_mae <- mean(abs(final_preds - test_y))
+
+print(final_rmse)
+print(final_mae)
+
+test_y_vector <- as.numeric(coredata(test_y))
+final_preds_vector <- as.numeric(coredata(final_preds))
+forecast::accuracy(test_y_vector, final_preds_vector)
+```
+
+```{r}
+# Same as Daichis plotting
+
+plot(training_set$DateTime, training_set$filled_CO, type = "l", col = "black", xlab = "Time", ylab = "CO(GT)", main = "Model Fit for Training Period")
+
+# We have to fix the time due to some NAs getting dropped when we were doing the time shifting
+remaining_time <- training_set$DateTime[(8613 - 8445 + 1):8613]
+lines(remaining_time, predict(xgb_model, dtrain), col = "blue", lty = 1)
+legend("topright", legend = c("Actual", "Fitted"), col = c("black", "blue"), lty = c(1, 1))
+
+# Plotting for validation period
+plot(testing_set$DateTime, testing_set$filled_CO, type = "l", col = "black", xlab = "Time", ylab = "CO(GT)", main = "Forecast vs Actual for Test Period")
+lines(testing_set$DateTime, predict(xgb_model, dtest), col = "red", lty = 1)
+legend("topright", legend = c("Actual", "Forecast"), col = c("black", "red"), lty = c(1, 1))
+```
