@@ -132,10 +132,27 @@ hw_model <- HoltWinters(co_ts)
 print(hw_model)
 plot(hw_model)
 
+# Residuals for ACF and PACF
+hw_resid <- residuals(hw_model)
+hw_resid <- as.numeric(hw_resid) 
+# ACF Plot for HoltWinters Residuals
+acf(hw_resid, lag.max = 50, main = "ACF of Residuals (HoltWinters)")
+# PACF Plot for HoltWinters Residuals
+pacf(hw_resid, lag.max = 50, main = "PACF of Residuals (HoltWinters)")
+
+
 ## STL
 co_ts <- ts(data$`CO(GT)`, frequency = 24)
 stl_decomposition <- stl(co_ts, s.window = "periodic")
 plot(stl_decomposition)
+
+#Residuals for ACF and PACF
+stl_resid <- stl_decomposition$time.series[, "remainder"]
+stl_resid <- as.numeric(stl_resid)
+# ACF Plot
+acf(stl_resid, lag=50, main = "ACF of Residuals (STL)")
+# PACF Plot
+pacf(stl_resid, lag=50, main = "PACF of Residuals (STL)")
 
 
 #######################
