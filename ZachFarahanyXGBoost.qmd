@@ -5,7 +5,8 @@ editor: visual
 ---
 
 ```{r}
-
+library(corrplot)
+library(lubridate)
 library(readxl)
 library(lubridate)
 library(imputeTS)
@@ -58,7 +59,12 @@ df <- df %>%
 ```
 
 ```{r}
-library(corrplot)
+kpss.test(df$filled_CO)
+first_diff <- diff(df$filled_CO)
+kpss.test(first_diff) # We may want to use this depending on the model
+```
+
+```{r}
 # Now find correlations
 
 # Calculate correlation matrix
@@ -70,6 +76,19 @@ corrplot(correlation_matrix, method = "color", type = "upper", order = "hclust",
 acf(df$filled_CO, lag.max = 200)
 acf(df$filled_CO ^ 2, lag.max = 200)
 pacf(df$filled_CO, lag.max = 50)
+
+# Feature engineering for ML
+df$Month <- month(df$DateTime)
+df$Day <- day(df$DateTime)
+df$Hour <- hour(df$DateTime)
+df$Minute <- minute(df$DateTime)
+df$Second <- second(df$DateTime)
+df$DayOfWeek <- wday(df$DateTime)
+df$IsWeekend <- ifelse(df$DayOfWeek %in% c("Sat", "Sun"), 1, 0)
+df$Quarter <- quarter(df$DateTime)
+df$DayOfYear <- yday(df$DateTime)
+df$WeekOfYear <- week(df$DateTime)
+
 
 ggplot(df, aes(x = DateTime, y = filled_CO)) +
   geom_line(group = 1, colour = "black", size = .2) +  # Line plot
@@ -124,17 +143,20 @@ print(inverse_frequencies)
 ## XGB Model
 
 ```{r}
-# Convert Date to a time series object
-# This code is basically just the same as the stuff that we did in class except with RF
-ts_xts <- xts(df$filled_CO, order.by = df$DateTime)
-lags <- 1:168 # Number of lags to consider
-lagged_data <- lapply(lags, function(l) lag(ts_xts, l))
-lagged_df <- data.frame(lagged_data)
-colnames(lagged_df) <- paste0("lag_", lags) # Rename columns with lag prefixes
-lagged_xts <- xts(lagged_df, order.by = index(ts_xts))
-lagged_xts <- na.omit(lagged_xts)
-final_data <- cbind(ts_xts, lagged_xts)
-final_data <- na.omit(final_data)
+ts_df <- df[, c("DateTime", "filled_CO")]
+features_df <- df[, c("DateTime", "Month", "Day", "Hour", "Minute", "Second", "DayOfWeek", "IsWeekend", "Quarter", "DayOfYear", "WeekOfYear")]
+
+lags <- 0:168
+lagged_data <- lapply(lags, function(l) lag(ts_df$filled_CO, l))
+lagged_df <- data.frame(DateTime = ts_df$DateTime, lagged_data)
+colnames(lagged_df) <- c("DateTime", paste0("lag_", lags))
+
+merged_df <- merge(features_df, lagged_df, by = "DateTime")
+merged_df <- na.omit(merged_df)
+
+final_xts <- xts(merged_df[, -1], order.by = merged_df$DateTime)
+
+final_data <- na.omit(final_xts)
 start_index_for_test <- nrow(final_data) - nrow(testing_set) + 1
 train_data <- final_data[1:(start_index_for_test - 1), ]
 test_data <- final_data[start_index_for_test:nrow(final_data), ]
@@ -145,16 +167,17 @@ Let's train the XGBoost model now
 ```{r}
 # Convert to XGB data objects
 library(xgboost)
-train_y <- train_data[, 1]
-test_y <- test_data[, 1]
-train_x <- train_data[, -1]
-test_x <- test_data[, -1]
+
+# 11 is the non-lagged data which will be marked as log_0 which is the original data
+train_y <- train_data[, 11]
+test_y <- test_data[, 11]
+train_x <- train_data[, -11]
+test_x <- test_data[, -11]
 dtrain <- xgb.DMatrix(data = as.matrix(train_x), label = train_y)
 dtest <- xgb.DMatrix(data = as.matrix(test_x), label = test_y)
 ```
 
 ```{r}
-# Try a random XGB config to see if it might be good
 params <- list(
   booster = "gbtree",
   objective = "reg:squarederror",
@@ -192,7 +215,7 @@ sampled_params <- param_grid %>% sample_n(n_samples)
 
 results <- data.frame()
 
-val_size <- 30 * 24 # Get a month of hourly data
+val_size <- 30 * 24
 val_indices <- seq(nrow(dtrain) - val_size + 1, nrow(dtrain))
 subset_indices <- seq(1, nrow(dtrain) - val_size)
 dval <- slice(dtrain, val_indices)
@@ -211,10 +234,8 @@ for(i in 1:nrow(sampled_params)) {
     lambda = sampled_params$lambda[i]
   )
   
-  # Number of boosting rounds
   num_rounds <- 500
   
-  # Train the model using the subset of training data
   xgb_model <- xgb.train(
     params = params,
     data = dtrain_subset,
@@ -225,16 +246,13 @@ for(i in 1:nrow(sampled_params)) {
     maximize = FALSE
   )
   
-  # Evaluate the model on the validation set
   val_preds <- predict(xgb_model, dval)
   val_rmse <- sqrt(mean((getinfo(dval, "label") - val_preds)^2))
   
-  # Store the results
   results <- rbind(results, c(sampled_params[i, ], RMSE = val_rmse))
   print(paste("Validation RMSE for iteration", i, ":", val_rmse))
 }
 
-# Review the results to find the best parameters
 best_params <- results[which.min(results$RMSE), ]
 print("Best parameters found:")
 print(best_params)
@@ -314,4 +332,11 @@ legend("topright", legend = c("Actual", "Fitted"), col = c("black", "blue"), lty
 plot(testing_set$DateTime, testing_set$filled_CO, type = "l", col = "black", xlab = "Time", ylab = "CO(GT)", main = "Forecast vs Actual for Test Period")
 lines(testing_set$DateTime, predict(xgb_model, dtest), col = "red", lty = 1)
 legend("topright", legend = c("Actual", "Forecast"), col = c("black", "red"), lty = c(1, 1))
+```
+
+## Residual Analysis
+
+```{r}
+residuals <- testing_set$filled_CO - predict(xgb_model, dtest)
+checkresiduals(residuals, lag = 100)
 ```
